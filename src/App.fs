@@ -1,0 +1,297 @@
+module App
+
+open System
+
+open Elmish
+open Elmish.React
+open Feliz
+open Fable.SimpleHttp
+open Thoth.Json
+open Fable.DateFunctions
+
+type HackernewsItem =
+    { id: int
+      title: string
+      url: string option
+      score: int
+      time: int }
+
+[<RequireQualifiedAccess>]
+type Stories =
+    | New
+    | Top
+    | Best
+    | Job
+
+type DeferredResult<'t> = Deferred<Result<'t, string>>
+
+type DeferredStoryItem = DeferredResult<HackernewsItem>
+
+type State =
+    { CurrentStories: Stories
+      StoryItems: DeferredResult<Map<int, DeferredStoryItem>> }
+
+type Msg =
+    | ChangeStories of Stories
+    | LoadStoryItems of AsyncOperationStatus<Result<int list, string>>
+    | LoadedStoryItem of int * Result<HackernewsItem, string>
+
+let init () =
+    let initialState =
+        { CurrentStories = Stories.New
+          StoryItems = Deferred.HasNotStartedYet }
+
+    let initialCmd = Cmd.ofMsg (LoadStoryItems Started)
+    initialState, initialCmd
+
+let itemDecoder: Decoder<HackernewsItem> =
+    Decode.object (fun fields ->
+        { id = fields.Required.At [ "id" ] Decode.int
+          title = fields.Required.At [ "title" ] Decode.string
+          url = fields.Optional.At [ "url" ] Decode.string
+          score = fields.Required.At [ "score" ] Decode.int
+          time = fields.Required.At [ "time" ] Decode.int })
+
+let rnd = System.Random()
+
+let loadStoryItem itemId =
+    async {
+        //do! Async.Sleep(rnd.Next(1000, 3000))
+        let endpoint =
+            sprintf "https://hacker-news.firebaseio.com/v0/item/%d.json" itemId
+
+        let! (status, responseText) = Http.get endpoint
+        match status with
+        | 200 ->
+            match Decode.fromString itemDecoder responseText with
+            | Ok storyItem -> return LoadedStoryItem(itemId, Ok storyItem)
+            | Error parseError -> return LoadedStoryItem(itemId, Error parseError)
+        | _ -> return LoadedStoryItem(itemId, Error("Http error while loading " + string id))
+    }
+
+let storiesEndpoint stories =
+    let fromBaseUrl =
+        sprintf "https://hacker-news.firebaseio.com/v0/%sstories.json"
+
+    match stories with
+    | Stories.Best -> fromBaseUrl "best"
+    | Stories.Top -> fromBaseUrl "top"
+    | Stories.New -> fromBaseUrl "new"
+    | Stories.Job -> fromBaseUrl "job"
+
+
+let loadStoryItems stories =
+    async {
+        let endpoint = storiesEndpoint stories
+        let! (status, responseText) = Http.get endpoint
+        match status with
+        | 200 ->
+            let storyIds =
+                Decode.fromString (Decode.list Decode.int) responseText
+
+            match storyIds with
+            | Ok storyIds ->
+                let firstTenIds = storyIds |> List.truncate 10
+                return LoadStoryItems(Finished(Ok firstTenIds))
+
+            | Error errorMsg -> return LoadStoryItems(Finished(Error errorMsg))
+        | _ -> return LoadStoryItems(Finished(Error responseText))
+    }
+
+let update msg state =
+    match msg with
+    | ChangeStories stories ->
+        let nextState =
+            { state with
+                  StoryItems = Deferred.InProgress
+                  CurrentStories = stories }
+
+        let nextCmd = Cmd.fromAsync (loadStoryItems stories)
+        nextState, nextCmd
+    | LoadStoryItems Started ->
+        let nextState =
+            { state with
+                  StoryItems = Deferred.InProgress }
+
+        let nextCmd =
+            Cmd.fromAsync (loadStoryItems state.CurrentStories)
+
+        nextState, nextCmd
+    | LoadStoryItems (Finished (Ok storyIds)) ->
+        let storiesMap =
+            Map.ofList [ for id in storyIds -> id, Deferred.InProgress ]
+
+        let nextState =
+            { state with
+                  StoryItems = Deferred.Resolved(Ok storiesMap) }
+
+        nextState, Cmd.batch [ for id in storyIds -> Cmd.fromAsync (loadStoryItem id) ]
+    | LoadedStoryItem (itemId, Ok storyItem) ->
+        match state.StoryItems with
+        | Deferred.Resolved (Ok storiesMap) ->
+            let modifiedStoriesMap =
+                storiesMap
+                |> Map.remove itemId
+                |> Map.add itemId (Deferred.Resolved(Ok storyItem))
+
+            let nextState =
+                { state with
+                      StoryItems = Deferred.Resolved(Ok modifiedStoriesMap) }
+
+            nextState, Cmd.none
+        | _ -> state, Cmd.none
+    | LoadedStoryItem (itemId, Error error) ->
+        match state.StoryItems with
+        | Deferred.Resolved (Ok storiesMap) ->
+            let modifiedStoriesMap =
+                storiesMap
+                |> Map.remove itemId
+                |> Map.add itemId (Deferred.Resolved(Error error))
+
+            let nextState =
+                { state with
+                      StoryItems = Deferred.Resolved(Ok modifiedStoriesMap) }
+
+            nextState, Cmd.none
+        | _ -> state, Cmd.none
+
+    | LoadStoryItems (Finished (Error error)) ->
+        let nextState =
+            { state with
+                  StoryItems = Deferred.Resolved(Error error) }
+
+        nextState, Cmd.none
+
+let storyCategories =
+    [ Stories.New
+      Stories.Top
+      Stories.Best
+      Stories.Job ]
+
+let storiesName =
+    function
+    | Stories.New -> "New"
+    | Stories.Best -> "Best"
+    | Stories.Top -> "Top"
+    | Stories.Job -> "Job"
+
+let div (classes: string list) (children: ReactElement list) =
+    Html.div
+        [ prop.className classes
+          prop.children children ]
+
+let renderTabs selectedStories dispatch =
+    let switchStories stories =
+        if selectedStories <> stories then dispatch (ChangeStories stories)
+
+    Html.div
+        [ prop.className [ "tabs"; "is-toggle"; "is-fullwidth" ]
+          prop.children
+              [ Html.ul
+                  [ for stories in storyCategories ->
+                      Html.li
+                          [ prop.className [ if selectedStories = stories then "is-active" ]
+                            prop.onClick (fun _ -> switchStories stories)
+                            prop.children [ Html.a [ Html.span (storiesName stories) ] ] ] ] ] ]
+
+let renderError (errorMsg: string) =
+    Html.h1
+        [ prop.style [ style.color.red ]
+          prop.text errorMsg ]
+
+let distanceFromNow timeStamp =
+    let start =
+        DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+
+    let itemDateTime =
+        start.AddSeconds(float timeStamp).ToLocalTime()
+
+    sprintf "%s ago" (itemDateTime.DistanceInWords(DateTime.Now))
+
+
+let renderItem item =
+    Html.div
+        [ prop.key item.id
+          prop.className "box"
+          prop.style
+              [ style.marginTop 15
+                style.marginBottom 15 ]
+          prop.children
+              [ div [ "columns"; "is-mobile" ]
+                    [ div [ "column"; "is-narrow" ]
+                          [ Html.div
+                              [ prop.className [ "icon" ]
+                                prop.style [ style.marginLeft 20 ]
+                                prop.children
+                                    [ Html.i [ prop.className "fa fa-poll fa-2x" ]
+                                      Html.span
+                                          [ prop.style
+                                              [ style.marginLeft 10
+                                                style.marginRight 10 ]
+                                            prop.text item.score ] ] ] ]
+
+                      div [ "column" ]
+                          [ match item.url with
+                            | Some url ->
+                                Html.a
+                                    [ prop.style [ style.textDecoration.underline ]
+                                      prop.target.blank
+                                      prop.href url
+                                      prop.text item.title ]
+                            | None -> Html.p item.title ]
+                      Html.span
+                          [ prop.className [ "column is-narrow" ]
+                            prop.style
+                                [ style.marginLeft 10
+                                  style.marginRight 10 ]
+                            prop.text (distanceFromNow item.time) ] ] ] ]
+
+
+let spinner =
+    Html.div
+        [ prop.style
+            [ style.textAlign.center
+              style.marginTop 20 ]
+          prop.children [ Html.i [ prop.className "fa fa-cog fa-spin fa-2x" ] ] ]
+
+let renderStory =
+    function
+    | Deferred.HasNotStartedYet -> Html.none
+    | Deferred.InProgress -> spinner
+    | Deferred.Resolved (Error errorMsg) -> renderError errorMsg
+    | Deferred.Resolved (Ok item) -> renderItem item
+
+let sortOrder =
+    function
+    | Deferred.HasNotStartedYet -> 1
+    | Deferred.InProgress -> 2
+    | Deferred.Resolved (Error _) -> 3
+    | Deferred.Resolved (Ok item) -> item.time
+
+let renderStories =
+    function
+    | Deferred.HasNotStartedYet -> Html.none
+    | Deferred.InProgress -> spinner
+    | Deferred.Resolved (Error errorMsg) -> renderError errorMsg
+    | Deferred.Resolved (Ok items) ->
+        items
+        |> Map.toList
+        |> List.sortByDescending (fun (_, item) -> sortOrder item)
+        |> List.map (fun (id, item) -> renderStory item)
+        |> Html.div
+
+let render (state: State) (dispatch: Msg -> unit) =
+    Html.div
+        [ prop.style [ style.padding 20 ]
+          prop.children
+              [ Html.h1
+                  [ prop.className "title"
+                    prop.text "Elmish Hackernews" ]
+
+                renderTabs state.CurrentStories dispatch
+
+                renderStories state.StoryItems ] ]
+
+Program.mkProgram init update render
+|> Program.withReactSynchronous "elmish-app"
+|> Program.run
